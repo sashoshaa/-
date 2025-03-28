@@ -1,0 +1,458 @@
+import os
+import random
+import asyncio
+from fastapi import FastAPI, Request
+from fastapi.templating import Jinja2Templates
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
+import mysql.connector
+from datetime import datetime, timedelta
+import requests  # Для Telegram API
+
+# --- КОНФИГУРАЦИЯ ---
+TELEGRAM_BOT_TOKEN = "7435664822:AAHtNmx5XRXPw076Zd1iouulust2_5n27xo"
+TELEGRAM_CHAT_ID = "877886344"  # Ваш chat_id
+MYSQL_CONFIG = {
+    "host": "localhost",
+    "user": "root",
+    "password": "Dorogusha1",
+    "database": "z2"
+}
+
+# --- АВТОСОЗДАНИЕ ФАЙЛОВ ---
+os.makedirs("templates", exist_ok=True)
+os.makedirs("static", exist_ok=True)
+os.makedirs("static/css", exist_ok=True)
+
+# Favicon (можно заменить своим)
+with open("static/favicon.ico", "wb") as f:
+    f.write(b"")
+
+# CSS стили
+with open("static/css/style.css", "w", encoding="utf-8") as f:
+    f.write("""
+    :root {
+        --primary: #4361ee;
+        --secondary: #3f37c9;
+        --accent: #4895ef;
+    }
+    body {
+        font-family: 'Segoe UI', sans-serif;
+        line-height: 1.6;
+        color: #333;
+        max-width: 1200px;
+        margin: 0 auto;
+        padding: 20px;
+        background-color: #f8f9fa;
+    }
+    header {
+        background: linear-gradient(135deg, var(--primary), var(--secondary));
+        color: white;
+        padding: 2rem;
+        border-radius: 10px;
+        margin-bottom: 2rem;
+        box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+    }
+    .card {
+        background: white;
+        border-radius: 8px;
+        padding: 1.5rem;
+        margin-bottom: 1.5rem;
+        box-shadow: 0 2px 4px rgba(0,0,0,0.05);
+    }
+    button {
+        background-color: var(--accent);
+        color: white;
+        border: none;
+        padding: 10px 20px;
+        border-radius: 5px;
+        cursor: pointer;
+        font-size: 16px;
+        transition: all 0.3s;
+    }
+    button:hover {
+        background-color: var(--secondary);
+        transform: translateY(-2px);
+    }
+    .chart-container {
+        height: 400px;
+        margin: 2rem 0;
+    }
+    .visits-table {
+        width: 100%;
+        border-collapse: collapse;
+    }
+    .visits-table th, .visits-table td {
+        padding: 12px;
+        text-align: left;
+        border-bottom: 1px solid #ddd;
+    }
+    .visits-table tr:hover {
+        background-color: #f5f5f5;
+    }
+    .alert {
+        padding: 15px;
+        background-color: #f8d7da;
+        color: #721c24;
+        border-radius: 5px;
+        margin: 1rem 0;
+    }
+    """)
+
+# HTML шаблон
+with open("templates/dashboard.html", "w", encoding="utf-8") as f:
+    f.write("""<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Мониторинг посещений</title>
+    <link rel="icon" href="/favicon.ico">
+    <link rel="stylesheet" href="/static/css/style.css">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <script src="/static/script.js"></script>
+</head>
+<body>
+    <header>
+        <h1>📊 Система мониторинга посещений</h1>
+        <p>Аналитика посещаемости в реальном времени с оповещениями</p>
+    </header>
+
+    <div class="card">
+        <h2>Управление</h2>
+        <div class="controls">
+            <button onclick="addVisit()">➕ Добавить посещение</button>
+            <select id="userType">
+                <option value="guest">Гость</option>
+                <option value="employee">Сотрудник</option>
+                <option value="vip">VIP-персона</option>
+            </select>
+            <button onclick="startAutoGeneration()">🔁 Автогенерация</button>
+            <button onclick="stopAutoGeneration()">⏹ Остановить</button>
+        </div>
+    </div>
+
+    <div class="card">
+        <h2>Статистика</h2>
+        <div class="stats">
+            <h3>Всего посещений: <span id="total" class="highlight">0</span></h3>
+            <p>Последнее: <span id="lastVisitTime">-</span></p>
+        </div>
+
+        <div class="chart-container">
+            <canvas id="visitsChart"></canvas>
+        </div>
+    </div>
+
+    <div class="card">
+        <h2>Последние посещения</h2>
+        <div class="table-responsive">
+            <table class="visits-table">
+                <thead>
+                    <tr>
+                        <th>Время</th>
+                        <th>Тип</th>
+                        <th>Действия</th>
+                    </tr>
+                </thead>
+                <tbody id="visitsTableBody"></tbody>
+            </table>
+        </div>
+    </div>
+
+    <div class="card">
+        <h2>О системе</h2>
+        <p>Эта система предназначена для:</p>
+        <ul>
+            <li>📈 Учета посещаемости офиса/мероприятия</li>
+            <li>🔔 Мгновенных оповещений о важных событиях</li>
+            <li>📊 Анализа активности в реальном времени</li>
+        </ul>
+    </div>
+</body>
+</html>""")
+
+# JavaScript
+with open("static/script.js", "w", encoding="utf-8") as f:
+    f.write("""let chart;
+let autoGenerationInterval;
+
+async function loadData() {
+    try {
+        const response = await fetch("/stats");
+        if (!response.ok) throw new Error("Ошибка загрузки");
+        const data = await response.json();
+        
+        // Обновляем статистику
+        document.getElementById("total").textContent = data.total;
+        if (data.visits.length > 0) {
+            const lastVisit = new Date(data.visits[0].time);
+            document.getElementById("lastVisitTime").textContent = lastVisit.toLocaleString();
+        }
+        
+        // Обновляем таблицу
+        renderVisitsTable(data.visits);
+        
+        // Обновляем график
+        updateChart(data.visits);
+    } catch (error) {
+        console.error("Ошибка:", error);
+        showAlert("Ошибка загрузки данных");
+    }
+}
+
+function renderVisitsTable(visits) {
+    const tableBody = document.getElementById("visitsTableBody");
+    tableBody.innerHTML = visits.map(visit => `
+        <tr>
+            <td>${new Date(visit.time).toLocaleString()}</td>
+            <td>${getTypeBadge(visit.type)}</td>
+            <td><button onclick="deleteVisit(${visit.id})">Удалить</button></td>
+        </tr>
+    `).join("");
+}
+
+function getTypeBadge(type) {
+    const badges = {
+        'guest': '<span class="badge blue">Гость</span>',
+        'employee': '<span class="badge green">Сотрудник</span>',
+        'vip': '<span class="badge gold">VIP</span>'
+    };
+    return badges[type] || type;
+}
+
+async function addVisit() {
+    const userType = document.getElementById("userType").value;
+    try {
+        const response = await fetch(`/visit?user_type=${userType}`, { 
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' }
+        });
+        
+        if (!response.ok) throw new Error("Ошибка сервера");
+        await loadData();
+        showAlert("Посещение добавлено!", "success");
+    } catch (error) {
+        console.error("Ошибка:", error);
+        showAlert("Ошибка при добавлении");
+    }
+}
+
+async function deleteVisit(id) {
+    if (!confirm("Удалить запись?")) return;
+    try {
+        const response = await fetch(`/visit/${id}`, { method: 'DELETE' });
+        if (!response.ok) throw new Error("Ошибка сервера");
+        await loadData();
+        showAlert("Запись удалена", "success");
+    } catch (error) {
+        console.error("Ошибка:", error);
+        showAlert("Ошибка при удалении");
+    }
+}
+
+function startAutoGeneration() {
+    if (autoGenerationInterval) return;
+    autoGenerationInterval = setInterval(async () => {
+        const types = ['guest', 'employee', 'vip'];
+        const randomType = types[Math.floor(Math.random() * types.length)];
+        await fetch(`/visit?user_type=${randomType}`, { method: 'POST' });
+        await loadData();
+    }, 5000);  // Каждые 5 секунд
+    showAlert("Автогенерация запущена", "success");
+}
+
+function stopAutoGeneration() {
+    if (autoGenerationInterval) {
+        clearInterval(autoGenerationGenerationInterval);
+        autoGenerationInterval = null;
+        showAlert("Автогенерация остановлена", "info");
+    }
+}
+
+function updateChart(visits) {
+    const ctx = document.getElementById('visitsChart').getContext('2d');
+    
+    // Группируем по часам
+    const hours = {};
+    visits.forEach(v => {
+        const date = new Date(v.time);
+        const hour = `${date.getHours()}:00`;
+        hours[hour] = (hours[hour] || 0) + 1;
+    });
+    
+    if (chart) chart.destroy();
+    
+    chart = new Chart(ctx, {
+        type: 'bar',
+        data: {
+            labels: Object.keys(hours),
+            datasets: [{
+                label: 'Посещения по часам',
+                data: Object.values(hours),
+                backgroundColor: '#4895ef',
+                borderColor: '#4361ee',
+                borderWidth: 1
+            }]
+        },
+        options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            scales: {
+                y: {
+                    beginAtZero: true,
+                    ticks: {
+                        stepSize: 1
+                    }
+                }
+            }
+        }
+    });
+}
+
+function showAlert(message, type = "error") {
+    const alert = document.createElement("div");
+    alert.className = `alert ${type}`;
+    alert.textContent = message;
+    document.body.prepend(alert);
+    setTimeout(() => alert.remove(), 3000);
+}
+
+// Загружаем данные при старте и каждые 10 секунд
+document.addEventListener('DOMContentLoaded', () => {
+    loadData();
+    setInterval(loadData, 10000);
+});
+""")
+
+# --- FASTAPI ПРИЛОЖЕНИЕ ---
+app = FastAPI()
+app.mount("/static", StaticFiles(directory="static"), name="static")
+templates = Jinja2Templates(directory="templates")
+
+# --- РАБОТА С БАЗОЙ ДАННЫХ ---
+def get_db():
+    return mysql.connector.connect(**MYSQL_CONFIG)
+
+def init_db():
+    try:
+        db = get_db()
+        cursor = db.cursor()
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS visits (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+            user_type VARCHAR(20) DEFAULT 'guest'
+        )
+        """)
+        db.commit()
+    except Exception as e:
+        print(f"Ошибка инициализации БД: {e}")
+    finally:
+        if 'db' in locals(): db.close()
+
+init_db()
+
+# --- TELEGRAM ОПОВЕЩЕНИЯ ---
+async def send_telegram_notification(message: str):
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+    
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": message,
+        "parse_mode": "HTML"
+    }
+    
+    try:
+        response = requests.post(url, json=payload)
+        response.raise_for_status()
+    except Exception as e:
+        print(f"Ошибка отправки в Telegram: {e}")
+
+# --- API ENDPOINTS ---
+@app.post("/visit")
+async def add_visit(user_type: str = "guest"):
+    db = get_db()
+    cursor = db.cursor()
+    try:
+        cursor.execute("INSERT INTO visits (user_type) VALUES (%s)", (user_type,))
+        db.commit()
+        visit_id = cursor.lastrowid
+        
+        # Отправляем оповещение
+        await send_telegram_notification(
+            f"🚀 Новое посещение!\n"
+            f"Тип: {user_type}\n"
+            f"Время: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+            f"ID: {visit_id}"
+        )
+        
+        return {"status": "ok", "id": visit_id}
+    finally:
+        cursor.close()
+        db.close()
+
+@app.delete("/visit/{visit_id}")
+async def delete_visit(visit_id: int):
+    db = get_db()
+    cursor = db.cursor()
+    try:
+        cursor.execute("DELETE FROM visits WHERE id = %s", (visit_id,))
+        db.commit()
+        return {"status": "ok", "deleted": cursor.rowcount}
+    finally:
+        cursor.close()
+        db.close()
+
+@app.get("/stats")
+async def get_stats():
+    db = get_db()
+    cursor = db.cursor(dictionary=True)
+    try:
+        # Общее количество
+        cursor.execute("SELECT COUNT(*) as total FROM visits")
+        total = cursor.fetchone()["total"]
+        
+        # Последние 10 посещений
+        cursor.execute("""
+        SELECT 
+            id,
+            timestamp as time,
+            user_type as type
+        FROM visits 
+        ORDER BY time DESC 
+        LIMIT 10
+        """)
+        visits = cursor.fetchall()
+        
+        return {"total": total, "visits": visits}
+    finally:
+        cursor.close()
+        db.close()
+
+@app.get("/favicon.ico")
+async def favicon():
+    return FileResponse("static/favicon.ico")
+
+@app.get("/")
+async def dashboard(request: Request):
+    return templates.TemplateResponse("dashboard.html", {"request": request})
+
+# --- ФОНГОВАЯ ГЕНЕРАЦИЯ ДАННЫХ ---
+async def background_data_generation():
+    while True:
+        await asyncio.sleep(random.randint(30, 120))  # Рандомные интервалы 30-120 сек
+        user_types = ['guest', 'employee', 'vip']
+        user_type = random.choice(user_types)
+        await add_visit(user_type)
+
+# Запускаем фоновую задачу
+@app.on_event("startup")
+async def startup_event():
+    asyncio.create_task(background_data_generation())
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
